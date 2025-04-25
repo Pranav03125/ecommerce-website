@@ -3,14 +3,18 @@ from app.database import DatabaseConnection, hash_password, verify_password
 import traceback
 from flask_login import login_required, current_user, login_user, logout_user
 import logging
-from app import User  # Import the User class from __init__.py
+from app import User
+from . import mail  
+from flask_mail import Message
+from datetime import datetime, timedelta
+from random import randint
+from flask_login import logout_user
 
 # No need to import create_app here, because routes will be initialized from __init__.py
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 db = DatabaseConnection()
-
 
 def init_routes(app):
     @app.route('/')
@@ -33,64 +37,104 @@ def init_routes(app):
             flash(f"Error loading products: {e}", 'error')
             return render_template('home.html', products=[])
 
+    
+
+
     @app.route('/login', methods=['GET', 'POST'])
     def login():
-        """Enhanced user login route with additional security"""
-        # Check if user is already logged in
+        # If already logged in, skip everything
         if current_user.is_authenticated:
             flash('You are already logged in', 'info')
             return redirect(url_for('home'))
-        
+
+        # === PHASE 2: Verify OTP ===
+        # This branch only runs after we’ve sent an OTP and redirected here
+        if request.method == 'POST' and session.get('otp_step'):
+            entered_otp = request.form.get('otp')
+            sent_time = datetime.fromisoformat(session.get('otp_time'))
+            
+            # Expiry check (5 minutes)
+            if datetime.utcnow() - sent_time > timedelta(minutes=5):
+                session.clear()
+                flash('OTP expired. Please log in again.', 'error')
+                return redirect(url_for('login'))
+
+            # Match?
+            if entered_otp == session.get('otp_code'):
+                # Fetch user data and log in
+                user_data = db.fetch_one(
+                    "SELECT id, username, email FROM users WHERE id = %s",
+                    (session['otp_user_id'],)
+                )
+                user_obj = User(user_data['id'], user_data['username'], user_data['email'])
+                login_user(user_obj)
+                session['user_id'] = user_data['id']
+                session['username'] = user_data['username']
+
+                # Clean up OTP session keys
+                for key in ('otp_step','otp_user_id','otp_code','otp_time'):
+                    session.pop(key, None)
+
+                flash('Login successful!', 'success')
+                return redirect(url_for('home'))
+            else:
+                flash('Invalid code. Please try again.', 'error')
+                return render_template('verify_otp.html')
+
+        # === PHASE 1: Username/Password ===
         if request.method == 'POST':
             username = request.form['username']
             password = request.form['password']
-            
-            # Fetch user with a more secure query
+
+            # Your existing secure lookup + rate-limiting…
             query = """
             SELECT id, username, password, email, 
                    (SELECT COUNT(*) FROM login_attempts 
-                    WHERE user_id = users.id AND timestamp > NOW() - INTERVAL 1 HOUR) as recent_attempts
+                    WHERE user_id = users.id AND timestamp > NOW() - INTERVAL 1 HOUR) AS recent_attempts
             FROM users 
             WHERE username = %s
             """
             user = db.fetch_one(query, (username,))
-            
-            # Check for excessive login attempts
+
             if user and user['recent_attempts'] >= 5:
                 flash('Too many login attempts. Please try again later.', 'error')
                 return render_template('login.html')
-            
+
             if user and verify_password(user['password'], password):
-                # Successful login - Create User object and login
-                user_obj = User(user['id'], user['username'], user['email'])
-                login_user(user_obj)
-                
-                # Store user info in session as well
-                session['user_id'] = user['id']
-                session['username'] = user['username']
-                
-                # Clear any previous login attempts
-                clear_attempts_query = """
-                DELETE FROM login_attempts 
-                WHERE user_id = %s
-                """
-                db.execute_query(clear_attempts_query, (user['id'],))
-                
-                flash('Login successful!', 'success')
-                return redirect(url_for('home'))
+                # ✅ Credentials OK → generate OTP
+                otp = randint(100000, 999999)
+                session['otp_step']    = True
+                session['otp_user_id'] = user['id']
+                session['otp_code']    = str(otp)
+                session['otp_time']    = datetime.utcnow().isoformat()
+
+                # Send it via Flask-Mail
+                msg = Message("Your Fashion Store Login Code", recipients=[user['email']])
+                msg.body = f"Hello {user['username']},\n\nYour one-time login code is: {otp}\nIt expires in 5 minutes."
+                mail.send(msg)
+
+                flash('An OTP has been sent to your email. Please enter it below.', 'info')
+                return render_template('verify_otp.html')
+
             else:
-                # Record failed login attempt
-                record_attempt_query = """
-                INSERT INTO login_attempts 
-                (user_id, username, timestamp) 
+                # Record failed attempt (as before)
+                record_attempt = """
+                INSERT INTO login_attempts (user_id, username, timestamp)
                 VALUES ((SELECT id FROM users WHERE username = %s), %s, NOW())
                 """
-                db.execute_query(record_attempt_query, (username, username))
-                
+                db.execute_query(record_attempt, (username, username))
                 flash('Invalid username or password', 'error')
-        
-        return render_template('login.html')
 
+        # GET request or fall-through: show login form
+        return render_template('login.html')
+                            
+    @app.route('/logout')
+    def logout():
+        logout_user()         # <- clears Flask-Login's logged-in state
+        session.clear()       # <- clears everything in Flask's session (like user_id, username)
+        flash('You have been logged out.', 'info')
+        return redirect(url_for('login'))
+    
     @app.route('/register', methods=['GET', 'POST'])
     def register():
         """User registration route with enhanced error handling"""
@@ -165,16 +209,6 @@ def init_routes(app):
         return render_template('register.html')
 
 
-
-
-
-    @app.route('/logout')
-    def logout():
-        """User logout route"""
-        logout_user()  # Flask-Login logout
-        session.clear()  # Clear the session
-        flash('You have been logged out', 'success')
-        return redirect(url_for('home'))
 
     @app.route('/product/<int:product_id>')
     def product_detail(product_id):
@@ -448,100 +482,125 @@ def init_routes(app):
 
     @app.route('/checkout', methods=['GET', 'POST'])
     def checkout():
-        """Checkout process"""
+        """Checkout process with multiple payment options and item persistence"""
         if 'user_id' not in session:
             flash('Please login to proceed with checkout', 'error')
             return redirect(url_for('login'))
 
         try:
-            # ✅ Fetch cart items
+            # 1. Fetch cart items
             cart_query = """
             SELECT c.id, p.id AS product_id, p.name, p.price, c.quantity, 
-                   (p.price * c.quantity) AS total_price,
-                   p.stock
+                   p.stock, (p.price * c.quantity) AS total_price
             FROM cart c
             JOIN products p ON c.product_id = p.id
             WHERE c.user_id = %s
             """
             cart_items = db.fetch_all(cart_query, (session['user_id'],))
 
-            # ✅ Check if cart is empty
             if not cart_items:
                 flash('Your cart is empty', 'error')
                 return redirect(url_for('home'))
 
-            # ✅ Calculate total cart value
             total_cart_value = sum(item['total_price'] for item in cart_items)
 
-            # ✅ Handle POST request (order submission)
             if request.method == 'POST':
-                full_name = request.form.get('full_name')
-                address = request.form.get('address')
+                # 2. Gather form data
+                full_name    = request.form.get('full_name')
+                address      = request.form.get('address')
                 phone_number = request.form.get('phone_number')
-                city = request.form.get('city')
-                postal_code = request.form.get('postal_code')
+                city         = request.form.get('city')
+                postal_code  = request.form.get('postal_code')
+                payment_mode = request.form.get('payment_mode', 'COD')
+                card_number  = request.form.get('card_number')
+                upi_id       = request.form.get('upi_id')
 
-                # ✅ Basic validation
+                # 3. Validation
                 if not all([full_name, address, phone_number, city, postal_code]):
                     flash('Please fill in all delivery details', 'error')
-                    return render_template('checkout.html', cart_items=cart_items, total_cart_value=total_cart_value)
+                    return render_template('checkout.html',
+                                           cart_items=cart_items,
+                                           total_cart_value=total_cart_value)
+
+                if payment_mode == 'Card' and not card_number:
+                    flash('Card details are required for Card payment.', 'error')
+                    return render_template('checkout.html',
+                                           cart_items=cart_items,
+                                           total_cart_value=total_cart_value)
+
+                if payment_mode == 'UPI' and not upi_id:
+                    flash('UPI ID is required for UPI payment.', 'error')
+                    return render_template('checkout.html',
+                                           cart_items=cart_items,
+                                           total_cart_value=total_cart_value)
+
+                # 4. Begin transaction
+                db.connection.autocommit = False
+                cursor = db.connection.cursor()
 
                 try:
-                    # ✅ Start a database transaction
-                    db.connection.autocommit = False
-                    cursor = db.connection.cursor()
-
-                    # ✅ Create the order
+                    # 5. Insert order
                     order_query = """
                     INSERT INTO orders 
-                    (user_id, total_price, payment_status, full_name, address, 
-                     phone_number, city, postal_code) 
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                      (user_id, total_price, payment_status, full_name,
+                       address, phone_number, city, postal_code, payment_mode)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """
-                    order_params = (
-                        session['user_id'], total_cart_value, 'Cash on Delivery', 
-                        full_name, address, phone_number, city, postal_code
-                    )
-                    cursor.execute(order_query, order_params)
-                    order_id = cursor.lastrowid  # ✅ Get the newly inserted order ID
+                    cursor.execute(order_query, (
+                        session['user_id'],
+                        total_cart_value,
+                        'Pending',       # you can change status logic later
+                        full_name,
+                        address,
+                        phone_number,
+                        city,
+                        postal_code,
+                        payment_mode
+                    ))
+                    order_id = cursor.lastrowid
 
-                    # ✅ Insert order items and update stock
+                    # 6. Insert order_items and update stock
                     for item in cart_items:
+                        # stock check
                         if item['quantity'] > item['stock']:
                             raise Exception(f"Insufficient stock for {item['name']}")
 
-                        order_item_query = """
-                        INSERT INTO order_items 
-                        (order_id, product_id, quantity, price) 
-                        VALUES (%s, %s, %s, %s)
-                        """
-                        cursor.execute(order_item_query, (order_id, item['product_id'], item['quantity'], item['total_price']))
+                        # insert into order_items
+                        cursor.execute(
+                            "INSERT INTO order_items (order_id, product_id, quantity, price) "
+                            "VALUES (%s, %s, %s, %s)",
+                            (order_id, item['product_id'], item['quantity'], item['total_price'])
+                        )
 
-                        update_stock_query = """
-                        UPDATE products 
-                        SET stock = stock - %s 
-                        WHERE id = %s
-                        """
-                        cursor.execute(update_stock_query, (item['quantity'], item['product_id']))
+                        # decrement stock
+                        cursor.execute(
+                            "UPDATE products SET stock = stock - %s WHERE id = %s",
+                            (item['quantity'], item['product_id'])
+                        )
 
-                    # ✅ Clear the user's cart
-                    clear_cart_query = "DELETE FROM cart WHERE user_id = %s"
-                    cursor.execute(clear_cart_query, (session['user_id'],))
+                    # 7. Clear cart
+                    cursor.execute("DELETE FROM cart WHERE user_id = %s",
+                                   (session['user_id'],))
 
-                    # ✅ Commit transaction
+                    # 8. Commit
                     db.connection.commit()
                     flash('Order placed successfully! Thank you for your purchase.', 'success')
                     return redirect(url_for('order_confirmation', order_id=order_id))
 
                 except Exception as order_error:
-                    db.connection.rollback()  # ✅ Rollback on error
+                    db.connection.rollback()
                     flash(f'Order processing failed: {order_error}', 'error')
+                    return render_template('checkout.html',
+                                           cart_items=cart_items,
+                                           total_cart_value=total_cart_value)
 
                 finally:
-                    db.connection.autocommit = True  # ✅ Reset autocommit
+                    db.connection.autocommit = True
 
-            # ✅ Render checkout page
-            return render_template('checkout.html', cart_items=cart_items, total_cart_value=total_cart_value)
+            # GET: render checkout form
+            return render_template('checkout.html',
+                                   cart_items=cart_items,
+                                   total_cart_value=total_cart_value)
 
         except Exception as e:
             flash(f'Checkout error: {e}', 'error')
@@ -954,37 +1013,6 @@ def init_routes(app):
                                orders=recent_orders, 
                                total_spent=total_spent)
 
-    @app.route('/order-history')
-    @login_required
-    def order_history():
-        # Fetch all user orders 
-        user_id = current_user.id
-        page = request.args.get('page', 1, type=int)
-        per_page = 10
-        offset = (page - 1) * per_page
-        
-        # Get total orders for pagination
-        count_query = "SELECT COUNT(*) as count FROM orders WHERE user_id = %s"
-        count_result = db.fetch_one(count_query, (user_id,))
-        total_orders = count_result['count'] if count_result else 0
-        
-        # Get paginated orders
-        orders_query = """
-        SELECT * FROM orders 
-        WHERE user_id = %s 
-        ORDER BY created_at DESC
-        LIMIT %s OFFSET %s
-        """
-        orders = db.fetch_all(orders_query, (user_id, per_page, offset))
-        
-        # Calculate total pages
-        total_pages = (total_orders + per_page - 1) // per_page
-        
-        return render_template('order_history.html', 
-                              orders=orders, 
-                              page=page, 
-                              total_pages=total_pages)
-
     @app.route('/account-settings', methods=['GET', 'POST'])
     @login_required
     def account_settings():
@@ -1021,3 +1049,53 @@ def init_routes(app):
         user_data = db.fetch_one(user_query, (user_id,))
         
         return render_template('account_settings.html', user=user_data)
+    @app.route('/my-orders')
+    def my_orders():
+        if 'user_id' not in session:
+            flash('Please login to view your orders', 'error')
+            return redirect(url_for('login'))
+
+        try:
+            orders_query = """
+            SELECT id, total_price, payment_status, payment_mode, full_name, city, created_at
+            FROM orders
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+            """
+            orders = db.fetch_all(orders_query, (session['user_id'],))
+            return render_template('my_orders.html', orders=orders)
+        except Exception as e:
+            flash(f'Failed to load your orders: {e}', 'error')
+            return redirect(url_for('home'))
+    @app.route('/order/<int:order_id>', endpoint='order_details')
+    def view_order(order_id):
+        # ✅ now Flask will resolve it as 'order_details'
+
+        if 'user_id' not in session:
+            flash('Please login to view order details', 'error')
+            return redirect(url_for('login'))
+
+        try:
+            order_query = """
+            SELECT * FROM orders
+            WHERE id = %s AND user_id = %s
+            """
+            order = db.fetch_one(order_query, (order_id, session['user_id']))
+            if not order:
+                flash("Order not found", "error")
+                return redirect(url_for('my_orders'))
+
+            items_query = """
+            SELECT oi.*, p.name AS product_name
+            FROM order_items oi
+            JOIN products p ON oi.product_id = p.id
+            WHERE oi.order_id = %s
+            """
+            order_items = db.fetch_all(items_query, (order_id,))
+
+            return render_template('order_details.html', order=order, order_items=order_items)
+        except Exception as e:
+            flash(f"Failed to load order details: {e}", "error")
+            return redirect(url_for('my_orders'))
+
+
