@@ -4,12 +4,16 @@ import os
 from flask_session import Session
 import logging
 from flask_login import LoginManager, UserMixin
+from flask_mail import Mail
+
 
 # ✅ Initialize Database Connection
 db = DatabaseConnection()
 
 # ✅ Initialize Flask-Login
 login_manager = LoginManager()
+# — initialize the Mail extension
+mail = Mail()
 
 # Add User class here
 class User(UserMixin):
@@ -47,6 +51,15 @@ def create_app():
     
     # ✅ Set Secret Key
     app.secret_key = os.urandom(24)
+    app.config.update(
+        MAIL_SERVER      = 'smtp.gmail.com',
+        MAIL_PORT        = 587,
+        MAIL_USE_TLS     = True,
+        MAIL_USERNAME    = 'your email',
+        MAIL_PASSWORD    = 'your app password',
+        MAIL_DEFAULT_SENDER = ('Fashion Store','your email')
+    )
+    mail.init_app(app)
 
     # ✅ Configure Flask-Login
     login_manager.init_app(app)
@@ -67,5 +80,6 @@ def create_app():
     # ✅ Import routes inside create_app() to avoid circular imports
     from app import routes
     routes.init_routes(app)
+    
 
     return app
