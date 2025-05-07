@@ -1,6 +1,7 @@
 from flask import render_template, request, redirect, url_for, session, flash
 from app.database import DatabaseConnection, hash_password, verify_password
 import traceback
+from flask import jsonify
 from flask_login import login_required, current_user, login_user, logout_user
 import logging
 from app import User
@@ -134,6 +135,22 @@ def init_routes(app):
         session.clear()       # <- clears everything in Flask's session (like user_id, username)
         flash('You have been logged out.', 'info')
         return redirect(url_for('login'))
+    @app.route('/check_username')
+    def check_username():
+        username = request.args.get('username')
+        
+        if not username:
+            return jsonify({'exists': False})
+        
+        try:
+            query = "SELECT * FROM users WHERE username = %s"
+            result = db.fetch_one(query, (username,))
+            return jsonify({'exists': result is not None})
+        except Exception as e:
+            logger.error(f"Username check failed: {e}")
+            return jsonify({'exists': False})
+
+
     
     @app.route('/register', methods=['GET', 'POST'])
     def register():
